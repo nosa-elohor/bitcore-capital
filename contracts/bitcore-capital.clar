@@ -273,3 +273,148 @@
     (ok (map-set collateral-prices { asset: asset } { price: new-price }))
   )
 )
+
+;; CORE LENDING OPERATIONS - USER FUNCTIONS
+
+;; Collateral Deposit Interface
+;; @desc: Enables users to deposit Bitcoin as lending collateral
+;; @param: amount - amount of BTC to deposit (in satoshis)
+;; @returns: success status
+(define-public (deposit-collateral (amount uint))
+  (begin
+    (asserts! (var-get platform-initialized) ERR-NOT-INITIALIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (var-set total-btc-locked (+ (var-get total-btc-locked) amount))
+    (ok true)
+  )
+)
+
+;; Loan Origination Engine
+;; @desc: Creates new collateralized lending positions
+;; @param: collateral - amount of BTC collateral
+;; @param: loan-amount - desired loan amount in STX
+;; @returns: loan ID upon successful creation
+(define-public (request-loan
+    (collateral uint)
+    (loan-amount uint)
+  )
+  (let (
+      (btc-price (unwrap! (get price (map-get? collateral-prices { asset: "BTC" }))
+        ERR-NOT-INITIALIZED
+      ))
+      (collateral-value (* collateral btc-price))
+      (required-collateral (* loan-amount (var-get minimum-collateral-ratio)))
+      (loan-id (+ (var-get total-loans-issued) u1))
+    )
+    (begin
+      (asserts! (var-get platform-initialized) ERR-NOT-INITIALIZED)
+      (asserts! (>= collateral-value required-collateral)
+        ERR-INSUFFICIENT-COLLATERAL
+      )
+      ;; Create new loan record
+      (map-set loans { loan-id: loan-id } {
+        borrower: tx-sender,
+        collateral-amount: collateral,
+        loan-amount: loan-amount,
+        interest-rate: u5, ;; 5% annual interest rate
+        start-height: stacks-block-height,
+        last-interest-calc: stacks-block-height,
+        status: "active",
+      })
+      ;; Update user loan portfolio
+      (match (map-get? user-loans { user: tx-sender })
+        existing-loans (map-set user-loans { user: tx-sender } { active-loans: (unwrap!
+          (as-max-len? (append (get active-loans existing-loans) loan-id) u10)
+          ERR-INVALID-AMOUNT
+        ) }
+        )
+        (map-set user-loans { user: tx-sender } { active-loans: (list loan-id) })
+      )
+      ;; Update protocol metrics
+      (var-set total-loans-issued (+ (var-get total-loans-issued) u1))
+      (ok loan-id)
+    )
+  )
+)
+
+;; Loan Repayment Processing
+;; @desc: Handles loan closure with interest settlement
+;; @param: loan-id - loan to repay
+;; @param: amount - repayment amount
+;; @returns: success status
+(define-public (repay-loan
+    (loan-id uint)
+    (amount uint)
+  )
+  (begin
+    ;; Primary loan ID validation
+    (asserts! (validate-loan-id loan-id) ERR-INVALID-LOAN-ID)
+    (let (
+        (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR-LOAN-NOT-FOUND))
+        (interest-owed (calculate-interest (get loan-amount loan) (get interest-rate loan)
+          (- stacks-block-height (get last-interest-calc loan))
+        ))
+        (total-owed (+ (get loan-amount loan) interest-owed))
+      )
+      (begin
+        ;; Loan state and authorization checks
+        (asserts! (is-eq (get status loan) "active") ERR-LOAN-NOT-ACTIVE)
+        (asserts! (is-eq (get borrower loan) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (>= amount total-owed) ERR-INVALID-AMOUNT)
+        ;; Process loan closure
+        (map-set loans { loan-id: loan-id }
+          (merge loan {
+            status: "repaid",
+            last-interest-calc: stacks-block-height,
+          })
+        )
+        ;; Release collateral back to borrower
+        (var-set total-btc-locked
+          (- (var-get total-btc-locked) (get collateral-amount loan))
+        )
+        ;; Clean up user loan tracking
+        (match (map-get? user-loans { user: tx-sender })
+          existing-loans (ok (map-set user-loans { user: tx-sender } { active-loans: (filter not-equal-loan-id (get active-loans existing-loans)) }))
+          (ok false)
+        )
+      )
+    )
+  )
+)
+
+;; READ-ONLY FUNCTIONS - DATA QUERIES
+
+;; Loan Information Retrieval
+;; @desc: Returns comprehensive loan details for specified ID
+;; @param: loan-id - loan identifier
+;; @returns: loan details or none
+(define-read-only (get-loan-details (loan-id uint))
+  (map-get? loans { loan-id: loan-id })
+)
+
+;; User Portfolio Query
+;; @desc: Retrieves all active loans for specified user
+;; @param: user - user principal address
+;; @returns: user's active loans or none
+(define-read-only (get-user-loans (user principal))
+  (map-get? user-loans { user: user })
+)
+
+;; Protocol Analytics Dashboard
+;; @desc: Returns current platform operational metrics
+;; @returns: comprehensive platform statistics
+(define-read-only (get-platform-stats)
+  {
+    total-btc-locked: (var-get total-btc-locked),
+    total-loans-issued: (var-get total-loans-issued),
+    minimum-collateral-ratio: (var-get minimum-collateral-ratio),
+    liquidation-threshold: (var-get liquidation-threshold),
+  }
+)
+
+;; Supported Assets Registry
+;; @desc: Returns list of protocol-supported collateral assets
+;; @returns: list of valid asset symbols
+(define-read-only (get-valid-assets)
+  VALID-ASSETS
+)
